@@ -9,7 +9,8 @@ import "net/http"
 
 type Coordinator struct {
 	// Your definitions here.
-
+	files []string
+	nReduce int
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -63,8 +64,18 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
-
+	c.files = files
+	c.nReduce = nReduce
 
 	c.server()
 	return &c
+}
+
+//
+// change states of the Coordinator.
+// All modification of fields in the Coordinator happen here,
+// this excludes the use of locks.
+//
+func (c *Coordinator) mainLoop() {
+	
 }
