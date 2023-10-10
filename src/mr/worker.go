@@ -36,43 +36,11 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	// Work on map tasks.
 	for {
 		task := Task{}
-		ok := call("Coordinator.ReqMapTask", &Signal{}, &task)
+		ok := call("Coordinator.ReqTask", &Signal{}, &task)
 		if ok {
-			// Apply mapf to file data.
-			id, filename := task.id, task.file
-			file, err := os.Open(filename)
-			if err != nil {
-				log.Fatalf("cannot open %v", filename)
-			}
-			content, err := ioutil.ReadAll(file)
-			if err != nil {
-				log.Fatalf("cannot read %v", filename)
-			}
-			file.Close()
-			kva := mapf(filename, string(content))
-
-			// Disperse kva to n intermidate files.
-			kvmap := make(map[int][]KeyValue)
-			for i := 0; i < task.nReduce; i++ {
-				kvmap[i] = make([]KeyValue, 0)
-			}
-			for _, kv := range kva {
-				kvmap[id] = append(kvmap[ihash(kv.Key) % task.nReduce], kv)
-			}
-			for i := 0; i < task.nReduce; i++ {
-				file, err = os.CreateTemp(".", "*")
-				if err != nil {
-					log.Fatalf("cannot create tmp file")
-				}
-				enc := json.NewEncoder(file)
-				for _, kv := range kvmap[i] {
-					enc.Encode(&kv)
-				}
-				os.Rename(file.Name(), fmt.Sprintf("mr-%v-%v", id, i))
-			}
+			doTask(mapf, reducef, task)
 		} else {
 			log.Fatalf("call Coordinator.ReqMapTask failed")
 		}
@@ -80,11 +48,54 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Work on reduce tasks.
 	for {
-		
+
 	}
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+}
+
+func doTask(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string,
+	task Task) {
+	
+	switch task.t {
+	case Map:
+		// Apply mapf to file data.
+		id, filename := task.id, task.file
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", filename)
+		}
+		file.Close()
+		kva := mapf(filename, string(content))
+
+		// Disperse kva to n intermidate files.
+		kvmap := make(map[int][]KeyValue)
+		for i := 0; i < task.nReduce; i++ {
+			kvmap[i] = make([]KeyValue, 0)
+		}
+		for _, kv := range kva {
+			kvmap[id] = append(kvmap[ihash(kv.Key) % task.nReduce], kv)
+		}
+		for i := 0; i < task.nReduce; i++ {
+			file, err = os.CreateTemp(".", "*")
+			if err != nil {
+				log.Fatalf("cannot create tmp file")
+			}
+			enc := json.NewEncoder(file)
+			for _, kv := range kvmap[i] {
+				enc.Encode(&kv)
+			}
+			os.Rename(file.Name(), fmt.Sprintf("mr-%v-%v", id, i))
+		}
+	case Reduce:
+
+	}
 }
 
 //

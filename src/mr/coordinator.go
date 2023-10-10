@@ -6,68 +6,47 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
 	"time"
 )
 
-
 type Coordinator struct {
 	// Your definitions here.
-	files map[int]string
-	nReduce int
+	mu sync.RWMutex
+	done bool
 
-	issued map[int]bool
-	mapReqCh chan struct{}
-	mapRespCh chan int
-	mapDoneCh chan int
-
-	reduceReadyCh chan bool
-	reduceReqCh chan struct{}
-	reduceRespCh chan int
-	reduceDoneCh chan int
-
-	finishCh chan bool
+	ReqCh chan struct{}
+	RespCh chan Task
+	DoneCh chan Task
+	ReceiptCh chan Receipt
 }
 
 type Signal struct {}
-
+type TaskType int
+const (
+	Map TaskType = iota
+	Reduce
+)
 type Task struct {
 	id int
+	t TaskType
 	nReduce int
 	file string
 }
-
-type ReduceTask struct {
-	id int
+type Receipt struct {
+	isTasksAllDone bool
 }
-
-type TasksAllDone struct { isDone bool }
 
 // Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) ReqMapTask(args *Signal, reply *Task) error {
-	c.mapReqCh <- struct{}{}
-	id := <-c.mapRespCh
-	reply.id = id
-	reply.file = c.files[id]
-	reply.nReduce = c.nReduce
+func (c *Coordinator) ReqTask(args *Signal, reply *Task) error {
+	c.ReqCh <- struct{}{}
+	*reply = <-c.RespCh
 	return nil
 }
 
-func (c *Coordinator) MarkMapDone(args *Task, reply *TasksAllDone) error {
-	c.mapDoneCh <- args.id
-	reply.isDone = <-c.reduceReadyCh
-	return nil
-}
-
-func (c *Coordinator) ReqReduceTask(args *Signal, reply *ReduceTask) error {
-	c.reduceReqCh <- struct{}{}
-	id := <-c.reduceRespCh
-	reply.id = id
-	return nil
-}
-
-func (c *Coordinator) MarkReduceDone(args *ReduceTask, reply *TasksAllDone) error {
-	c.reduceDoneCh <- args.id
-	reply.isDone = <-c.finishCh
+func (c *Coordinator) SummitDone(args *Task, reply *Receipt) error {
+	c.DoneCh <- *args
+	*reply = <-c.ReceiptCh
 	return nil
 }
 
@@ -80,7 +59,6 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
-
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -106,7 +84,9 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-
+	c.mu.RLock()
+	ret = c.done
+	c.mu.RUnlock()
 
 	return ret
 }
@@ -121,19 +101,11 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// Your code here.
 	// Init coordinator.
-	for i, file := range files {
-		c.files[i] = file
-	}
-	c.nReduce = nReduce
-	c.issued = make(map[int]bool, len(files))
-	for id := range c.files {
-		c.issued[id] = false
-	}
-	c.mapReqCh = make(chan struct{})
-	c.mapRespCh = make(chan int)
-	c.mapDoneCh = make(chan int)
-	c.reduceReadyCh = make(chan bool)
-	go c.coordinate()
+	c.ReqCh = make(chan struct{})
+	c.RespCh = make(chan Task)
+	c.DoneCh = make(chan Task)
+	c.ReceiptCh = make(chan Receipt)
+	go c.coordinate(files, nReduce)
 
 	c.server()
 	return &c
@@ -144,34 +116,55 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 // All modification of fields in the Coordinator happen here,
 // this excludes the use of locks.
 //
-func (c *Coordinator) coordinate() {
-	doneChan := make(map[int]chan struct{}, len(c.files))
-	for id := range c.files {
-		doneChan[id] = make(chan struct{})
-	}
+func (c *Coordinator) coordinate(files []string, nReduce int) {
+	taskType, nMap := Map, len(files)
+	issued, timeoutChs := getIndicators(nMap)
 	for {
 		select {
-		case <-c.mapReqCh:
-			for id := range c.issued {
-				if !c.issued[id] {
-					c.issued[id] = true
-					c.mapRespCh <- id
+		case <-c.ReqCh:
+			for id := range issued {
+				if !issued[id] {
+					issued[id] = true
+					task := Task{id: id, t: taskType}
+					if taskType == Map {
+						task.file = files[id]
+						task.nReduce = nReduce
+					}
+					c.RespCh <- task
 					go func () {
 						select {
 						case <-time.After(10 * time.Second):
-							c.issued[id] = false
-						case <-doneChan[id]:
+							issued[id] = false
+						case <-timeoutChs[id]:
 						}
 					}()
 					break
 				}
 			}
-		case id := <-c.mapDoneCh:
-			doneChan[id] <- struct{}{}
-			delete(c.issued, id)
-			c.reduceReadyCh <- len(c.issued) == 0
-		case <-c.reduceReqCh:
-
+		case task := <-c.DoneCh:
+			timeoutChs[task.id] <- struct{}{}
+			delete(issued, task.id)
+			if len(issued) == 0 {
+				c.ReceiptCh <- Receipt{isTasksAllDone: true}
+				switch taskType {
+				case Map:
+					taskType = Reduce
+					issued, timeoutChs = getIndicators(nReduce)
+				case Reduce:
+					c.mu.Lock()
+					c.done = true
+					c.mu.Unlock()
+				}
+			}
 		}
 	}
+}
+
+func getIndicators(n int) (map[int]bool, map[int]chan struct{}) {
+	issued, timeoutChs := make(map[int]bool, n), make(map[int]chan struct{}, n)
+	for id := 0; id < n; id++ {
+		issued[id] = false
+		timeoutChs[id] = make(chan struct{})
+	}
+	return issued, timeoutChs
 }
