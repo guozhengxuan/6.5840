@@ -12,41 +12,48 @@ import (
 
 type Coordinator struct {
 	// Your definitions here.
-	mu sync.RWMutex
+	mu   sync.RWMutex
 	done bool
 
-	ReqCh chan struct{}
+	ReqCh  chan struct{}
 	RespCh chan Task
 	DoneCh chan Task
-	ReceiptCh chan Receipt
 }
 
-type Signal struct {}
+type Signal struct{}
 type TaskType int
+
 const (
 	Map TaskType = iota
 	Reduce
 )
+
 type Task struct {
-	id int
-	t TaskType
+	id      int
+	t       TaskType
 	nReduce int
-	file string
+	file    string
 }
 type Receipt struct {
-	isTasksAllDone bool
+	done bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) ReqTask(args *Signal, reply *Task) error {
+func (c *Coordinator) ReqTask(args *Signal, reply Task) error {
 	c.ReqCh <- struct{}{}
-	*reply = <-c.RespCh
+	reply = <-c.RespCh
 	return nil
 }
 
-func (c *Coordinator) SummitDone(args *Task, reply *Receipt) error {
+func (c *Coordinator) SummitDone(args *Task, reply *Signal) error {
 	c.DoneCh <- *args
-	*reply = <-c.ReceiptCh
+	return nil
+}
+
+func (c *Coordinator) HeartBeat(args *Signal, reply *Receipt) error {
+	c.mu.RLock()
+	reply.done = c.done
+	c.mu.RUnlock()
 	return nil
 }
 
@@ -104,7 +111,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.ReqCh = make(chan struct{})
 	c.RespCh = make(chan Task)
 	c.DoneCh = make(chan Task)
-	c.ReceiptCh = make(chan Receipt)
 	go c.coordinate(files, nReduce)
 
 	c.server()
@@ -118,7 +124,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 //
 func (c *Coordinator) coordinate(files []string, nReduce int) {
 	taskType, nMap := Map, len(files)
-	issued, timeoutChs := getIndicators(nMap)
+	issued, timeoutCh, liveChs := getIndicators(nMap)
 	for {
 		select {
 		case <-c.ReqCh:
@@ -131,25 +137,26 @@ func (c *Coordinator) coordinate(files []string, nReduce int) {
 						task.nReduce = nReduce
 					}
 					c.RespCh <- task
-					go func () {
+					go func() {
 						select {
 						case <-time.After(10 * time.Second):
-							issued[id] = false
-						case <-timeoutChs[id]:
+							timeoutCh <- id
+						case <-liveChs[id]:
 						}
 					}()
 					break
 				}
 			}
+		case id := <-timeoutCh:
+			issued[id] = false
 		case task := <-c.DoneCh:
-			timeoutChs[task.id] <- struct{}{}
+			liveChs[task.id] <- struct{}{}
 			delete(issued, task.id)
 			if len(issued) == 0 {
-				c.ReceiptCh <- Receipt{isTasksAllDone: true}
 				switch taskType {
 				case Map:
 					taskType = Reduce
-					issued, timeoutChs = getIndicators(nReduce)
+					issued, timeoutCh, liveChs = getIndicators(nReduce)
 				case Reduce:
 					c.mu.Lock()
 					c.done = true
@@ -160,11 +167,11 @@ func (c *Coordinator) coordinate(files []string, nReduce int) {
 	}
 }
 
-func getIndicators(n int) (map[int]bool, map[int]chan struct{}) {
-	issued, timeoutChs := make(map[int]bool, n), make(map[int]chan struct{}, n)
+func getIndicators(n int) (map[int]bool, chan int, map[int]chan struct{}) {
+	issued, timeoutCh, liveChs := make(map[int]bool, n), make(chan int, n), make(map[int]chan struct{}, n)
 	for id := 0; id < n; id++ {
 		issued[id] = false
-		timeoutChs[id] = make(chan struct{})
+		liveChs[id] = make(chan struct{})
 	}
-	return issued, timeoutChs
+	return issued, timeoutCh, liveChs
 }

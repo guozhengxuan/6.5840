@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"time"
 )
 
 //
@@ -28,7 +29,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -37,64 +37,82 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 	for {
-		task := Task{}
-		ok := call("Coordinator.ReqTask", &Signal{}, &task)
-		if ok {
-			doTask(mapf, reducef, task)
-		} else {
-			log.Fatalf("call Coordinator.ReqMapTask failed")
+		select {
+		case <-time.After(time.Second):
+			done := doHeartBeat()
+			if done {
+				return
+			}
+		default:
+			go reqTaskAndWork(mapf, reducef)
+			time.Sleep(time.Second)
 		}
 	}
 
-	// Work on reduce tasks.
-	for {
-
-	}
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
 }
 
-func doTask(mapf func(string, string) []KeyValue,
+func doHeartBeat() bool {
+	reply := Receipt{}
+	ok := call("Coordinator.HeartBeat", &Signal{}, &reply)
+	if ok {
+		return reply.done
+	} else {
+		log.Fatalf("call Coordinator.HeatBeat failed")
+		return false
+	}
+}
+
+func reqTaskAndWork(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string,
-	task Task) {
-	
-	switch task.t {
-	case Map:
-		// Apply mapf to file data.
-		id, filename := task.id, task.file
-		file, err := os.Open(filename)
-		if err != nil {
-			log.Fatalf("cannot open %v", filename)
-		}
-		content, err := ioutil.ReadAll(file)
-		if err != nil {
-			log.Fatalf("cannot read %v", filename)
-		}
-		file.Close()
-		kva := mapf(filename, string(content))
-
-		// Disperse kva to n intermidate files.
-		kvmap := make(map[int][]KeyValue)
-		for i := 0; i < task.nReduce; i++ {
-			kvmap[i] = make([]KeyValue, 0)
-		}
-		for _, kv := range kva {
-			kvmap[id] = append(kvmap[ihash(kv.Key) % task.nReduce], kv)
-		}
-		for i := 0; i < task.nReduce; i++ {
-			file, err = os.CreateTemp(".", "*")
+) {
+	task := Task{}
+	ok := call("Coordinator.ReqTask", &Signal{}, &task)
+	if ok {
+		// Work on the task.
+		switch task.t {
+		case Map:
+			// Apply mapf to file data.
+			id, filename := task.id, task.file
+			file, err := os.Open(filename)
 			if err != nil {
-				log.Fatalf("cannot create tmp file")
+				log.Fatalf("cannot open %v", filename)
 			}
-			enc := json.NewEncoder(file)
-			for _, kv := range kvmap[i] {
-				enc.Encode(&kv)
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v", filename)
 			}
-			os.Rename(file.Name(), fmt.Sprintf("mr-%v-%v", id, i))
-		}
-	case Reduce:
+			file.Close()
+			kva := mapf(filename, string(content))
 
+			// Disperse kva to n intermidate files.
+			kvmap := make(map[int][]KeyValue)
+			for i := 0; i < task.nReduce; i++ {
+				kvmap[i] = make([]KeyValue, 0)
+			}
+			for _, kv := range kva {
+				kvmap[id] = append(kvmap[ihash(kv.Key)%task.nReduce], kv)
+			}
+			for i := 0; i < task.nReduce; i++ {
+				file, err = os.CreateTemp(".", "*")
+				if err != nil {
+					log.Fatalf("cannot create tmp file")
+				}
+				enc := json.NewEncoder(file)
+				for _, kv := range kvmap[i] {
+					enc.Encode(&kv)
+				}
+				os.Rename(file.Name(), fmt.Sprintf("mr-%v-%v", id, i))
+			}
+		case Reduce:
+			// todo
+		}
+		// Inform Coordinator this work is done.
+		// todo
+	} else {
+		log.Fatalf("call Coordinator.ReqMapTask failed")
 	}
 }
 
