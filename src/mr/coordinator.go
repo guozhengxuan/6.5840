@@ -12,31 +12,62 @@ import (
 
 type Coordinator struct {
 	// Your definitions here.
-	files []string
+	files map[int]string
 	nReduce int
 
-	issued map[string]bool
-	mapReqChan chan struct{}
-	mapRespChan chan string
-	mapDoneChan chan string
+	issued map[int]bool
+	mapReqCh chan struct{}
+	mapRespCh chan int
+	mapDoneCh chan int
+
+	reduceReadyCh chan bool
+	reduceReqCh chan struct{}
+	reduceRespCh chan int
+	reduceDoneCh chan int
+
+	finishCh chan bool
 }
 
 type Signal struct {}
 
 type Task struct {
+	id int
+	nReduce int
 	file string
 }
 
+type ReduceTask struct {
+	id int
+}
+
+type TasksAllDone struct { isDone bool }
+
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) ReqMapTask(args *Signal, reply *Task) error {
-	c.mapReqChan <- struct{}{}
-	file := <-c.mapRespChan
-	reply.file = file
+	c.mapReqCh <- struct{}{}
+	id := <-c.mapRespCh
+	reply.id = id
+	reply.file = c.files[id]
+	reply.nReduce = c.nReduce
 	return nil
 }
 
-func (c *Coordinator) MarkMapDone(args *Task, reply *Signal) error {
-	c.mapDoneChan <- args.file
+func (c *Coordinator) MarkMapDone(args *Task, reply *TasksAllDone) error {
+	c.mapDoneCh <- args.id
+	reply.isDone = <-c.reduceReadyCh
+	return nil
+}
+
+func (c *Coordinator) ReqReduceTask(args *Signal, reply *ReduceTask) error {
+	c.reduceReqCh <- struct{}{}
+	id := <-c.reduceRespCh
+	reply.id = id
+	return nil
+}
+
+func (c *Coordinator) MarkReduceDone(args *ReduceTask, reply *TasksAllDone) error {
+	c.reduceDoneCh <- args.id
+	reply.isDone = <-c.finishCh
 	return nil
 }
 
@@ -90,15 +121,18 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// Your code here.
 	// Init coordinator.
-	c.files = files
-	c.nReduce = nReduce
-	c.issued = make(map[string]bool, len(files))
-	for _, f := range files {
-		c.issued[f] = false
+	for i, file := range files {
+		c.files[i] = file
 	}
-	c.mapReqChan = make(chan struct{})
-	c.mapRespChan = make(chan string)
-	c.mapDoneChan = make(chan string)
+	c.nReduce = nReduce
+	c.issued = make(map[int]bool, len(files))
+	for id := range c.files {
+		c.issued[id] = false
+	}
+	c.mapReqCh = make(chan struct{})
+	c.mapRespCh = make(chan int)
+	c.mapDoneCh = make(chan int)
+	c.reduceReadyCh = make(chan bool)
 	go c.coordinate()
 
 	c.server()
@@ -111,29 +145,33 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 // this excludes the use of locks.
 //
 func (c *Coordinator) coordinate() {
-	doneChan := make(map[string]chan struct{}, len(c.files))
-	for _, f := range c.files {
-		doneChan[f] = make(chan struct{})
+	doneChan := make(map[int]chan struct{}, len(c.files))
+	for id := range c.files {
+		doneChan[id] = make(chan struct{})
 	}
 	for {
 		select {
-		case <-c.mapReqChan:
-			for f := range c.issued {
-				if !c.issued[f] {
-					c.issued[f] = true
-					c.mapRespChan <- f
-					go func ()  {
+		case <-c.mapReqCh:
+			for id := range c.issued {
+				if !c.issued[id] {
+					c.issued[id] = true
+					c.mapRespCh <- id
+					go func () {
 						select {
-						case <-doneChan[f]:
 						case <-time.After(10 * time.Second):
-							c.issued[f] = false
+							c.issued[id] = false
+						case <-doneChan[id]:
 						}
 					}()
 					break
 				}
 			}
-		case f := <-c.mapDoneChan:
-			delete(c.issued, f)
+		case id := <-c.mapDoneCh:
+			doneChan[id] <- struct{}{}
+			delete(c.issued, id)
+			c.reduceReadyCh <- len(c.issued) == 0
+		case <-c.reduceReqCh:
+
 		}
 	}
 }
