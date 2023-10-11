@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -18,6 +20,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -56,19 +66,23 @@ func Worker(mapf func(string, string) []KeyValue,
 
 func doHeartBeat() bool {
 	reply := Receipt{}
+
 	ok := call("Coordinator.HeartBeat", &Signal{}, &reply)
 	if ok {
 		return reply.done
 	} else {
-		log.Fatalf("call Coordinator.HeatBeat failed")
-		return false
+		log.Println("call Coordinator.HeatBeat failed, assume coordinator exited")
+		log.Println("exited...")
+		return true
 	}
 }
 
 func reqTaskAndWork(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string,
 ) {
+
 	task := Task{}
+
 	ok := call("Coordinator.ReqTask", &Signal{}, &task)
 	if ok {
 		// Work on the task.
@@ -76,18 +90,23 @@ func reqTaskAndWork(mapf func(string, string) []KeyValue,
 		case Map:
 			// Apply mapf to file data.
 			id, filename := task.id, task.file
+
 			file, err := os.Open(filename)
 			if err != nil {
 				log.Fatalf("cannot open %v", filename)
 			}
+
 			content, err := ioutil.ReadAll(file)
 			if err != nil {
 				log.Fatalf("cannot read %v", filename)
 			}
+
 			file.Close()
+
+			// Collect kv pairs as map result.
 			kva := mapf(filename, string(content))
 
-			// Disperse kva to n intermidate files.
+			// Disperse kv pairs to n intermediate files.
 			kvmap := make(map[int][]KeyValue)
 			for i := 0; i < task.nReduce; i++ {
 				kvmap[i] = make([]KeyValue, 0)
@@ -95,22 +114,83 @@ func reqTaskAndWork(mapf func(string, string) []KeyValue,
 			for _, kv := range kva {
 				kvmap[id] = append(kvmap[ihash(kv.Key)%task.nReduce], kv)
 			}
+
 			for i := 0; i < task.nReduce; i++ {
 				file, err = os.CreateTemp(".", "*")
+
 				if err != nil {
 					log.Fatalf("cannot create tmp file")
 				}
+
 				enc := json.NewEncoder(file)
 				for _, kv := range kvmap[i] {
 					enc.Encode(&kv)
 				}
+
+				file.Close()
+
 				os.Rename(file.Name(), fmt.Sprintf("mr-%v-%v", id, i))
 			}
 		case Reduce:
-			// todo
+			// Find all intermediate files of reduce task with id.
+			files, err := filepath.Glob(fmt.Sprintf("mr-*-%v", task.id))
+			if err != nil {
+				log.Fatalf("Error finding intermidiate files of reduce task [id: %v]", task.id)
+			}
+			intermediate := make([]KeyValue, 0)
+
+			// Read intermediate files.
+			for _, fn := range files {
+				file, err := os.Open(fn)
+				if err != nil {
+					log.Fatalf("Cannot open %v", fn)
+				}
+				dec := json.NewDecoder(file)
+				for {
+				  var kv KeyValue
+				  if err := dec.Decode(&kv); err != nil {
+					break
+				  }
+				  intermediate = append(intermediate, kv)
+				}
+			}
+
+			// Sort kvs and apply reducef on them.
+			sort.Sort(ByKey(intermediate))
+
+			oname := fmt.Sprintf("mr-out-%v", task.id)
+			ofile, _ := os.CreateTemp(".", "*")
+
+			i := 0
+			for i < len(intermediate) {
+				j := i + 1
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+					j++
+				}
+
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value)
+				}
+
+				output := reducef(intermediate[i].Key, values)
+		
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		
+				i = j
+			}
+		
+			ofile.Close()
+
+			os.Rename(ofile.Name(), oname)
 		}
+
 		// Inform Coordinator this work is done.
-		// todo
+		ok := call("Coordinator.SummitDone", &task, &Signal{})
+		if !ok {
+			log.Fatalf("call Coordinator.SummitDone failed")
+		}
 	} else {
 		log.Fatalf("call Coordinator.ReqMapTask failed")
 	}
