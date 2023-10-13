@@ -20,28 +20,10 @@ type Coordinator struct {
 	DoneCh chan Task
 }
 
-type Signal struct{}
-type TaskType int
-
-const (
-	Map TaskType = iota
-	Reduce
-)
-
-type Task struct {
-	id      int
-	t       TaskType
-	nReduce int
-	file    string
-}
-type Receipt struct {
-	done bool
-}
-
 // Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) ReqTask(args *Signal, reply Task) error {
+func (c *Coordinator) ReqTask(args *Signal, reply *Task) error {
 	c.ReqCh <- struct{}{}
-	reply = <-c.RespCh
+	*reply = <-c.RespCh
 	return nil
 }
 
@@ -52,7 +34,7 @@ func (c *Coordinator) SummitDone(args *Task, reply *Signal) error {
 
 func (c *Coordinator) HeartBeat(args *Signal, reply *Receipt) error {
 	c.mu.RLock()
-	reply.done = c.done
+	reply.Done = c.done
 	c.mu.RUnlock()
 	return nil
 }
@@ -124,54 +106,71 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 //
 func (c *Coordinator) coordinate(files []string, nReduce int) {
 	taskType, nMap := Map, len(files)
-	issued, timeoutCh, liveChs := getIndicators(nMap)
+	issued, timeoutCh := getIndicators(nMap)
+
 	for {
 		select {
 		case <-c.ReqCh:
+			found := false
+
 			for id := range issued {
 				if !issued[id] {
-					issued[id] = true
-					task := Task{id: id, t: taskType}
+					found = true
+
+					task := Task{Id: id, Type: taskType}
 					if taskType == Map {
-						task.file = files[id]
-						task.nReduce = nReduce
+						task.Fn = files[id]
+						task.N = nReduce
 					}
+
 					c.RespCh <- task
+					issued[id] = true
+
 					go func() {
-						select {
-						case <-time.After(10 * time.Second):
-							timeoutCh <- id
-						case <-liveChs[id]:
-						}
+						<-time.After(10 * time.Second)
+						timeoutCh <- id
 					}()
+
 					break
 				}
 			}
+
+			if !found {
+				c.RespCh <- Task{}
+			}
+
 		case id := <-timeoutCh:
-			issued[id] = false
+			_, ok := issued[id]
+			if ok {
+				issued[id] = false
+			}
+
 		case task := <-c.DoneCh:
-			liveChs[task.id] <- struct{}{}
-			delete(issued, task.id)
+			delete(issued, task.Id)
+
 			if len(issued) == 0 {
 				switch taskType {
 				case Map:
 					taskType = Reduce
-					issued, timeoutCh, liveChs = getIndicators(nReduce)
+					issued, timeoutCh = getIndicators(nReduce)
+
 				case Reduce:
 					c.mu.Lock()
 					c.done = true
 					c.mu.Unlock()
+					return
 				}
 			}
 		}
 	}
 }
 
-func getIndicators(n int) (map[int]bool, chan int, map[int]chan struct{}) {
-	issued, timeoutCh, liveChs := make(map[int]bool, n), make(chan int, n), make(map[int]chan struct{}, n)
+func getIndicators(n int) (map[int]bool, chan int) {
+	issued, timeoutCh := make(map[int]bool, n), make(chan int, n)
+
 	for id := 0; id < n; id++ {
 		issued[id] = false
-		liveChs[id] = make(chan struct{})
 	}
-	return issued, timeoutCh, liveChs
+
+	return issued, timeoutCh
 }

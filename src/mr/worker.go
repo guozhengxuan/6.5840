@@ -54,7 +54,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				return
 			}
 		default:
-			go reqTaskAndWork(mapf, reducef)
+			reqTaskAndWork(mapf, reducef)
 			time.Sleep(time.Second)
 		}
 	}
@@ -69,7 +69,7 @@ func doHeartBeat() bool {
 
 	ok := call("Coordinator.HeartBeat", &Signal{}, &reply)
 	if ok {
-		return reply.done
+		return reply.Done
 	} else {
 		log.Println("call Coordinator.HeatBeat failed, assume coordinator exited")
 		log.Println("exited...")
@@ -85,11 +85,15 @@ func reqTaskAndWork(mapf func(string, string) []KeyValue,
 
 	ok := call("Coordinator.ReqTask", &Signal{}, &task)
 	if ok {
-		// Work on the task.
-		switch task.t {
+		if task == (Task{}) {
+			return
+		}
+
+		// Work on a task.
+		switch task.Type {
 		case Map:
 			// Apply mapf to file data.
-			id, filename := task.id, task.file
+			id, filename := task.Id, task.Fn
 
 			file, err := os.Open(filename)
 			if err != nil {
@@ -108,14 +112,15 @@ func reqTaskAndWork(mapf func(string, string) []KeyValue,
 
 			// Disperse kv pairs to n intermediate files.
 			kvmap := make(map[int][]KeyValue)
-			for i := 0; i < task.nReduce; i++ {
+			for i := 0; i < task.N; i++ {
 				kvmap[i] = make([]KeyValue, 0)
 			}
 			for _, kv := range kva {
-				kvmap[id] = append(kvmap[ihash(kv.Key)%task.nReduce], kv)
+				i := ihash(kv.Key) % task.N
+				kvmap[i] = append(kvmap[i], kv)
 			}
 
-			for i := 0; i < task.nReduce; i++ {
+			for i := 0; i < task.N; i++ {
 				file, err = os.CreateTemp(".", "*")
 
 				if err != nil {
@@ -133,9 +138,9 @@ func reqTaskAndWork(mapf func(string, string) []KeyValue,
 			}
 		case Reduce:
 			// Find all intermediate files of reduce task with id.
-			files, err := filepath.Glob(fmt.Sprintf("mr-*-%v", task.id))
+			files, err := filepath.Glob(fmt.Sprintf("mr-*-%v", task.Id))
 			if err != nil {
-				log.Fatalf("Error finding intermidiate files of reduce task [id: %v]", task.id)
+				log.Fatalf("Error finding intermidiate files of reduce task [id: %v]", task.Id)
 			}
 			intermediate := make([]KeyValue, 0)
 
@@ -147,18 +152,18 @@ func reqTaskAndWork(mapf func(string, string) []KeyValue,
 				}
 				dec := json.NewDecoder(file)
 				for {
-				  var kv KeyValue
-				  if err := dec.Decode(&kv); err != nil {
-					break
-				  }
-				  intermediate = append(intermediate, kv)
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					intermediate = append(intermediate, kv)
 				}
 			}
 
 			// Sort kvs and apply reducef on them.
 			sort.Sort(ByKey(intermediate))
 
-			oname := fmt.Sprintf("mr-out-%v", task.id)
+			oname := fmt.Sprintf("mr-out-%v", task.Id)
 			ofile, _ := os.CreateTemp(".", "*")
 
 			i := 0
@@ -174,13 +179,13 @@ func reqTaskAndWork(mapf func(string, string) []KeyValue,
 				}
 
 				output := reducef(intermediate[i].Key, values)
-		
+
 				// this is the correct format for each line of Reduce output.
 				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
-		
+
 				i = j
 			}
-		
+
 			ofile.Close()
 
 			os.Rename(ofile.Name(), oname)
@@ -189,10 +194,10 @@ func reqTaskAndWork(mapf func(string, string) []KeyValue,
 		// Inform Coordinator this work is done.
 		ok := call("Coordinator.SummitDone", &task, &Signal{})
 		if !ok {
-			log.Fatalf("call Coordinator.SummitDone failed")
+			log.Printf("call Coordinator.SummitDone failed")
 		}
 	} else {
-		log.Fatalf("call Coordinator.ReqMapTask failed")
+		log.Printf("call Coordinator.ReqTask failed")
 	}
 }
 
